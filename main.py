@@ -1,8 +1,8 @@
 """
-AstrBot 智能回复判断插件
-根据上下文和人格设置智能判断是否应该回复消息
+AstrBot EchoSense 回响感知插件
+像回响一样感知对话，智能判断是否应该回复消息
 
-基于 AstrBot 官方 helloworld 模板开发，参考 Heartflow 插件设计思路
+基于 AstrBot 官方 helloworld 模板开发
 """
 
 import json
@@ -12,9 +12,9 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 
-@register("astrbot_plugin_smart_reply", "智能回复判断插件", "根据上下文和人格设置智能判断是否回复消息", "0.0.2")
-class SmartReplyPlugin(Star):
-    """智能回复判断插件"""
+@register("astrbot_plugin_smart_reply", "EchoSense 回响感知", "像回响一样感知对话，智能判断是否回复消息", "0.0.2")
+class EchoSensePlugin(Star):
+    """EchoSense 回响感知插件"""
 
     # 默认判断 Prompt 模板
     DEFAULT_JUDGE_PROMPT = """你是一个智能对话判断系统。请分析以下对话上下文，判断机器人是否应该回复当前消息。
