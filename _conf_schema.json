@@ -2,7 +2,7 @@
   "basic": {
     "description": "基础设置",
     "type": "object",
-    "hint": "智能回复插件的基础配置项，包括消息过滤权限、上下文数量、判断提示词等。",
+    "hint": "智能回复插件的基础配置项，包括消息过滤权限、上下文数量、判断阈值等。",
     "items": {
       "filter_mode": {
         "description": "消息过滤模式",
@@ -25,6 +25,26 @@
         "type": "int",
         "hint": "获取的历史消息数量，用于上下文分析，建议范围 5-20",
         "default": 10
+      },
+      "reply_threshold": {
+        "description": "回复阈值",
+        "type": "float",
+        "hint": "综合评分达到此阈值才触发回复（0-1），值越大越不容易触发回复",
+        "default": 0.6
+      }
+    }
+  },
+  "model": {
+    "description": "模型设置",
+    "type": "object",
+    "hint": "选择用于判断和回复的模型提供商",
+    "items": {
+      "judge_provider_id": {
+        "description": "判断模型提供商",
+        "type": "string",
+        "_special": "select_provider",
+        "hint": "用于判断是否需要回复的模型。建议选择响应快的小模型。留空则使用当前对话默认模型。",
+        "default": ""
       }
     }
   },
@@ -36,8 +56,8 @@
       "judge_prompt": {
         "description": "LLM 判断提示词模板",
         "type": "text",
-        "hint": "支持变量: {history}, {current_msg}, {sender}",
-        "default": "你是一个智能对话判断助手。请分析以下对话上下文，判断机器人是否应该回复当前消息。\n\n判断标准：\n1. 消息是否针对机器人或需要机器人参与\n2. 是否有明确的回复意图或问题\n3. 上下文是否需要延续对话\n\n历史对话：\n{history}\n\n当前消息：{current_msg}\n发送者：{sender}\n\n请严格按照以下JSON格式输出结果，不要输出其他内容：\n{\"should_reply\": true或false, \"reason\": \"判断理由简述\", \"task\": \"任务规划描述（如需回复）\"}"
+        "hint": "支持变量: {persona}, {history}, {current_msg}, {sender}, {threshold}",
+        "default": "你是一个智能对话判断系统。请分析以下对话上下文，判断机器人是否应该回复当前消息。\n\n## 机器人角色设定\n{persona}\n\n## 历史对话\n{history}\n\n## 当前消息\n发送者: {sender}\n内容: {current_msg}\n\n## 判断标准\n请从以下维度评估（0-10分）：\n1. **内容相关度**: 消息是否有趣、有价值、适合机器人回复（结合角色设定）\n2. **回复意愿**: 基于角色特点，机器人是否应该主动参与此话题\n3. **社交适宜性**: 在当前氛围下回复是否合适\n4. **时机恰当性**: 回复时机是否恰当\n\n回复阈值: {threshold}（综合评分达到此分数才回复）\n\n请严格按照以下JSON格式输出结果，不要输出其他内容：\n{\"relevance\": 分数, \"willingness\": 分数, \"social\": 分数, \"timing\": 分数, \"should_reply\": true或false, \"reason\": \"判断理由\"}"
       }
     }
   }
