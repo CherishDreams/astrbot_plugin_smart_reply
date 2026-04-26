@@ -12,7 +12,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 
-@register("astrbot_plugin_smart_reply", "EchoSense 回响感知", "像回响一样感知对话，智能判断是否回复消息", "0.0.2")
+@register("astrbot_plugin_echosense", "EchoSense 回响感知", "像回响一样感知对话，智能判断是否回复消息", "0.0.2")
 class EchoSensePlugin(Star):
     """EchoSense 回响感知插件"""
 

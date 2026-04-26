@@ -1,6 +1,6 @@
-name: astrbot_plugin_smart_reply # 插件唯一识别名
+name: astrbot_plugin_echosense # 插件唯一识别名
 display_name: EchoSense 回响感知 # 用于展示的名字
 desc: 像回响一样感知对话，智能判断是否回复消息
-version: v0.0.1  # 插件版本号
+version: v0.0.2  # 插件版本号
 author: CherishDreams # 作者
-repo: https://github.com/CherishDreams/astrbot_plugin_smart_reply # 插件的仓库地址
+repo: https://github.com/CherishDreams/astrbot_plugin_echosense # 插件的仓库地址
