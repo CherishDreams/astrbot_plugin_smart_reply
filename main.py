@@ -8,13 +8,12 @@ AstrBot EchoSense 回响感知插件
 import json
 import re
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.api import logger
 
 
-@register("astrbot_plugin_echosense", "EchoSense 回响感知", "像回响一样感知对话，智能判断是否回复消息", "0.0.2")
 class EchoSensePlugin(Star):
-    """EchoSense 回响感知插件"""
+    """EchoSense 回响感知插件 - 像回响一样感知对话，智能判断是否回复消息"""
 
     # 默认判断 Prompt 模板
     DEFAULT_JUDGE_PROMPT = """你是一个智能对话判断系统。请分析以下对话上下文，判断机器人是否应该回复当前消息。
