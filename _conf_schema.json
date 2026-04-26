@@ -1,0 +1,44 @@
+{
+  "basic": {
+    "description": "基础设置",
+    "type": "object",
+    "hint": "智能回复插件的基础配置项，包括消息过滤权限、上下文数量、判断提示词等。",
+    "items": {
+      "filter_mode": {
+        "description": "消息过滤模式",
+        "type": "string",
+        "options": ["whitelist", "blacklist", "none"],
+        "default": "none",
+        "hint": "决定哪些消息会触发智能回复判断。whitelist=只处理列表中的会话；blacklist=屏蔽列表中的会话；none=处理所有消息。"
+      },
+      "filter_list": {
+        "type": "list",
+        "description": "会话白/黑名单列表",
+        "default": [],
+        "hint": "可填写完整会话ID（如 onebot:GroupMessage:123456）或群号/用户ID。使用 /sid 获取当前会话ID。",
+        "items": {
+          "type": "string"
+        }
+      },
+      "history_count": {
+        "description": "历史消息数量上限",
+        "type": "int",
+        "hint": "获取的历史消息数量，用于上下文分析，建议范围 5-20",
+        "default": 10
+      }
+    }
+  },
+  "prompt": {
+    "description": "提示词设置",
+    "type": "object",
+    "hint": "LLM 判断提示词相关配置",
+    "items": {
+      "judge_prompt": {
+        "description": "LLM 判断提示词模板",
+        "type": "text",
+        "hint": "支持变量: {history}, {current_msg}, {sender}",
+        "default": "你是一个智能对话判断助手。请分析以下对话上下文，判断机器人是否应该回复当前消息。\n\n判断标准：\n1. 消息是否针对机器人或需要机器人参与\n2. 是否有明确的回复意图或问题\n3. 上下文是否需要延续对话\n\n历史对话：\n{history}\n\n当前消息：{current_msg}\n发送者：{sender}\n\n请严格按照以下JSON格式输出结果，不要输出其他内容：\n{\"should_reply\": true或false, \"reason\": \"判断理由简述\", \"task\": \"任务规划描述（如需回复）\"}"
+      }
+    }
+  }
+}
