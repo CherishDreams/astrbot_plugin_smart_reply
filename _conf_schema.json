@@ -51,13 +51,13 @@
   "prompt": {
     "description": "提示词设置",
     "type": "object",
-    "hint": "LLM 判断提示词相关配置",
+    "hint": "LLM 分析提示词相关配置（批量分析模式）",
     "items": {
       "judge_prompt": {
-        "description": "LLM 判断提示词模板",
+        "description": "LLM 分析提示词模板",
         "type": "text",
-        "hint": "支持变量: {persona}, {history}, {current_msg}, {sender}, {threshold}",
-        "default": "你是一个智能对话判断系统。请分析以下对话上下文，判断机器人是否应该回复当前消息。\n\n## 机器人角色设定\n{persona}\n\n## 历史对话\n{history}\n\n## 当前消息\n发送者: {sender}\n内容: {current_msg}\n\n## 判断标准\n请从以下维度评估（0-10分）：\n1. **内容相关度**: 消息是否有趣、有价值、适合机器人回复（结合角色设定）\n2. **回复意愿**: 基于角色特点，机器人是否应该主动参与此话题\n3. **社交适宜性**: 在当前氛围下回复是否合适\n4. **时机恰当性**: 回复时机是否恰当\n\n回复阈值: {threshold}（综合评分达到此分数才回复）\n\n请严格按照以下JSON格式输出结果，不要输出其他内容：\n{{\"relevance\": 分数, \"willingness\": 分数, \"social\": 分数, \"timing\": 分数, \"should_reply\": true或false, \"reason\": \"判断理由\"}}"
+        "hint": "支持变量: {persona}, {background}, {recent}, {threshold}",
+        "default": "你是一个智能对话判断系统。请分析以下群聊对话，判断机器人是否应该参与当前话题。\n\n## 机器人角色设定\n{persona}\n\n## 对话历史（背景）\n{background}\n\n## 近期对话（待分析）\n{recent}\n\n## 判断标准\n请从以下维度评估（0-10分）：\n1. **内容相关度**: 话题是否有趣、有价值、适合机器人参与\n2. **回复意愿**: 基于角色特点，机器人是否应该主动参与\n3. **社交适宜性**: 在当前氛围下参与是否合适\n4. **时机恰当性**: 参与时机是否恰当\n\n回复阈值: {threshold}\n\n请严格按照以下JSON格式输出结果，不要输出其他内容：\n{{\"should_reply\": true或false, \"topic\": \"话题概要\", \"reply_strategy\": \"回复策略\", \"reply_target\": \"目标用户\", \"relevance\": 分数, \"willingness\": 分数, \"social\": 分数, \"timing\": 分数, \"reason\": \"判断理由\"}}"
       }
     }
   },
@@ -70,31 +70,62 @@
         "description": "跳过图片消息",
         "type": "bool",
         "default": true,
-        "hint": "图片消息不触发 LLM 判断。"
+        "hint": "图片消息不缓存到总账。"
       },
       "skip_face_message": {
         "description": "跳过表情消息",
         "type": "bool",
         "default": true,
-        "hint": "纯表情消息不触发 LLM 判断。"
-      },
-      "cooldown_seconds": {
-        "description": "回复冷却时间（秒）",
-        "type": "int",
-        "default": 30,
-        "hint": "触发回复后，在此时间内不再触发新判断。0表示禁用。"
+        "hint": "纯表情消息不缓存到总账。"
       },
       "min_text_length": {
         "description": "最小文本长度",
         "type": "int",
         "default": 2,
-        "hint": "文本长度小于此值不触发判断。"
+        "hint": "文本长度小于此值不缓存。"
+      }
+    }
+  },
+  "state_machine": {
+    "description": "状态机制设置",
+    "type": "object",
+    "hint": "控制插件何时从被动观察转为主动参与。",
+    "items": {
+      "observation_timeout": {
+        "description": "观察期超时（秒）",
+        "type": "int",
+        "default": 600,
+        "hint": "主动介入后，多久回到不在场状态。"
       },
-      "processing_lock": {
-        "description": "启用处理锁",
-        "type": "bool",
-        "default": true,
-        "hint": "同一会话只能同时处理一条消息。"
+      "dense_threshold": {
+        "description": "密集讨论消息阈值",
+        "type": "int",
+        "default": 10,
+        "hint": "时间窗口内消息数量达到此值触发密集讨论检测。"
+      },
+      "dense_participants": {
+        "description": "密集讨论参与人数阈值",
+        "type": "int",
+        "default": 3,
+        "hint": "参与人数达到此值才触发密集讨论检测。"
+      },
+      "dense_window": {
+        "description": "密集讨论时间窗口（秒）",
+        "type": "int",
+        "default": 60,
+        "hint": "检测密集讨论的时间窗口。"
+      },
+      "echo_threshold": {
+        "description": "复读检测阈值（次数）",
+        "type": "int",
+        "default": 3,
+        "hint": "同一内容出现次数达到此值触发复读检测。"
+      },
+      "echo_window": {
+        "description": "复读检测时间窗口（秒）",
+        "type": "int",
+        "default": 30,
+        "hint": "检测复读的时间窗口。"
       }
     }
   }

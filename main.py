@@ -3,6 +3,7 @@ AstrBot EchoSense 回响感知插件
 像回响一样感知对话，智能判断是否应该回复消息
 
 基于 AstrBot 官方 helloworld 模板开发
+采用完整状态机制：消息累积 + 密集讨论检测 + 复读检测
 """
 
 import json
@@ -14,34 +15,38 @@ from astrbot.api.star import Context, Star
 from astrbot.api import logger
 from astrbot.api.message_components import Plain, Image, Face
 
+from .core import ConversationLedger, StateManager, PluginState
+from .core.detectors import should_trigger_active_state
+from .models import AnalysisDecision
+
 
 class EchoSensePlugin(Star):
     """EchoSense 回响感知插件 - 像回响一样感知对话，智能判断是否回复消息"""
 
-    # 默认判断 Prompt 模板
-    DEFAULT_JUDGE_PROMPT = """你是一个智能对话判断系统。请分析以下对话上下文，判断机器人是否应该回复当前消息。
+    # 默认判断 Prompt 模板（用于批量分析）
+    DEFAULT_ANALYSIS_PROMPT = """你是一个智能对话判断系统。请分析以下群聊对话，判断机器人是否应该参与当前话题。
 
 ## 机器人角色设定
 {persona}
 
-## 历史对话
-{history}
+## 对话历史（背景）
+{background}
 
-## 当前消息
-发送者: {sender}
-内容: {current_msg}
+## 近期对话（待分析）
+{recent}
 
 ## 判断标准
 请从以下维度评估（0-10分）：
-1. **内容相关度**: 消息是否有趣、有价值、适合机器人回复（结合角色设定）
-2. **回复意愿**: 基于角色特点，机器人是否应该主动参与此话题
-3. **社交适宜性**: 在当前氛围下回复是否合适
-4. **时机恰当性**: 回复时机是否恰当
+1. **内容相关度**: 话题是否有趣、有价值、适合机器人参与
+2. **回复意愿**: 基于角色特点，机器人是否应该主动参与
+3. **社交适宜性**: 在当前氛围下参与是否合适
+4. **时机恰当性**: 参与时机是否恰当
 
-回复阈值: {threshold}（综合评分达到此分数才回复）
+回复阈值: {threshold}
 
 请严格按照以下JSON格式输出结果，不要输出其他内容：
-{{"relevance": 分数, "willingness": 分数, "social": 分数, "timing": 分数, "should_reply": true或false, "reason": "判断理由"}}"""
+{{"should_reply": true或false, "topic": "话题概要", "reply_strategy": "回复策略", "reply_target": "目标用户", "relevance": 分数, "willingness": 分数, "social": 分数, "timing": 分数, "reason": "判断理由"}}
+"""
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context, config)
@@ -60,43 +65,58 @@ class EchoSensePlugin(Star):
 
         # 提示词配置
         prompt_config = self.config.get("prompt", {})
-        self.judge_prompt = prompt_config.get("judge_prompt", self.DEFAULT_JUDGE_PROMPT)
+        self.judge_prompt = prompt_config.get("judge_prompt", self.DEFAULT_ANALYSIS_PROMPT)
 
         # 防刷屏配置
         anti_spam = self.config.get("anti_spam", {})
         self.skip_image_message = anti_spam.get("skip_image_message", True)
         self.skip_face_message = anti_spam.get("skip_face_message", True)
-        self.cooldown_seconds = anti_spam.get("cooldown_seconds", 30)
         self.min_text_length = anti_spam.get("min_text_length", 2)
-        self.processing_lock_enabled = anti_spam.get("processing_lock", True)
 
-        # 运行时状态追踪
-        self._cooldown_tracker: dict[str, float] = {}
-        self._processing_locks: dict[str, asyncio.Lock] = {}
+        # 状态机制配置
+        state_machine = self.config.get("state_machine", {})
+        self.observation_timeout = state_machine.get("observation_timeout", 600)
+        self.dense_threshold = state_machine.get("dense_threshold", 10)
+        self.dense_participants = state_machine.get("dense_participants", 3)
+        self.dense_window = state_machine.get("dense_window", 60)
+        self.echo_threshold = state_machine.get("echo_threshold", 3)
+        self.echo_window = state_machine.get("echo_window", 30)
+
+        # 核心组件
+        self.ledger = ConversationLedger()
+        self.state_manager = StateManager(self.observation_timeout)
+
+        # 异步任务追踪
+        self._pending_tasks: dict[str, asyncio.Task] = {}
+        self._analysis_interval = 2.0  # 分析任务最小间隔（秒）
+        self._last_analysis_time: dict[str, float] = {}
 
     async def initialize(self):
         """插件初始化方法"""
-        logger.info(f"智能回复插件初始化完成: 模式={self.filter_mode}, 过滤列表={len(self.filter_list)}条, 阈值={self.reply_threshold}, 判断模型={self.judge_provider_id or '默认'}")
-        logger.info(f"防刷屏配置: 跳过图片={self.skip_image_message}, 跳过表情={self.skip_face_message}, 冷却={self.cooldown_seconds}s, 处理锁={self.processing_lock_enabled}")
+        logger.info(
+            f"EchoSense 初始化完成: 模式={self.filter_mode}, "
+            f"过滤列表={len(self.filter_list)}条, 阈值={self.reply_threshold}"
+        )
+        logger.info(
+            f"状态机制: 观察超时={self.observation_timeout}s, "
+            f"密集检测={self.dense_threshold}条/{self.dense_window}s/{self.dense_participants}人, "
+            f"复读检测={self.echo_threshold}次/{self.echo_window}s"
+        )
 
     def _should_process(self, event: AstrMessageEvent) -> bool:
         """检查消息是否应该被处理"""
         if self.filter_mode == "none":
             return True
 
-        # 获取会话ID
         session_id = event.unified_msg_origin
         group_id = event.get_group_id()
         sender_id = event.message_obj.sender.user_id if event.message_obj.sender else None
 
-        # 检查是否在列表中（支持完整会话ID或简写ID）
         in_list = False
         for item in self.filter_list:
-            # 完整会话ID匹配
             if item == session_id:
                 in_list = True
                 break
-            # 简写ID匹配（群号或用户ID）
             if group_id and str(group_id) == str(item):
                 in_list = True
                 break
@@ -104,8 +124,6 @@ class EchoSensePlugin(Star):
                 in_list = True
                 break
 
-        # whitelist 模式：在列表中才处理
-        # blacklist 模式：不在列表中才处理
         if self.filter_mode == "whitelist":
             return in_list
         elif self.filter_mode == "blacklist":
@@ -114,16 +132,14 @@ class EchoSensePlugin(Star):
         return True
 
     def _check_message_type(self, event: AstrMessageEvent) -> tuple[bool, str]:
-        """检查消息类型是否应该跳过判断。返回 (should_skip, skip_reason)"""
+        """检查消息类型是否应该跳过"""
         messages = event.get_messages()
 
-        # 检查是否包含图片
         if self.skip_image_message:
             for comp in messages:
                 if isinstance(comp, Image):
                     return True, "包含图片消息"
 
-        # 检查是否为纯表情消息
         if self.skip_face_message:
             has_face = False
             has_text = False
@@ -138,7 +154,7 @@ class EchoSensePlugin(Star):
         return False, ""
 
     def _check_text_length(self, event: AstrMessageEvent) -> bool:
-        """检查文本长度是否足够触发判断"""
+        """检查文本长度"""
         if self.min_text_length <= 0:
             return True
 
@@ -149,211 +165,194 @@ class EchoSensePlugin(Star):
                 text_content += comp.text
 
         if not text_content.strip():
-            return True  # 不是纯文本消息，交给其他检查处理
+            return True
 
         return len(text_content.strip()) >= self.min_text_length
 
-    def _is_in_cooldown(self, session_id: str) -> bool:
-        """检查会话是否处于冷却期"""
-        if self.cooldown_seconds <= 0:
-            return False
+    def _extract_message_info(self, event: AstrMessageEvent) -> dict:
+        """提取消息信息用于缓存"""
+        messages = event.get_messages()
 
-        last_reply_time = self._cooldown_tracker.get(session_id, 0)
-        if last_reply_time == 0:
-            return False
+        # 检查是否包含图片
+        has_image = any(isinstance(comp, Image) for comp in messages)
 
-        elapsed = time.time() - last_reply_time
-        return elapsed < self.cooldown_seconds
+        # 提取文本内容
+        text_content = ""
+        for comp in messages:
+            if isinstance(comp, Plain):
+                text_content += comp.text
 
-    def _mark_reply_time(self, session_id: str) -> None:
-        """记录回复时间，开始冷却期"""
-        if self.cooldown_seconds > 0:
-            self._cooldown_tracker[session_id] = time.time()
-
-    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
-        """获取会话的处理锁"""
-        if session_id not in self._processing_locks:
-            self._processing_locks[session_id] = asyncio.Lock()
-        return self._processing_locks[session_id]
-
-    async def _get_history(self, event: AstrMessageEvent) -> str:
-        """获取对话历史"""
-        try:
-            uid = event.unified_msg_origin
-            conv_mgr = self.context.conversation_manager
-
-            if not conv_mgr:
-                logger.warning("对话管理器不可用")
-                return ""
-
-            curr_cid = await conv_mgr.get_curr_conversation_id(uid)
-            if not curr_cid:
-                return ""
-
-            conversation = await conv_mgr.get_conversation(uid, curr_cid)
-            if not conversation or not conversation.history:
-                return ""
-
-            history_text = conversation.history
-
-            # 截取最近的历史
-            if self.history_count > 0:
-                lines = history_text.split('\n')
-                if len(lines) > self.history_count * 2:
-                    lines = lines[-(self.history_count * 2):]
-                history_text = '\n'.join(lines)
-
-            return history_text
-
-        except Exception as e:
-            logger.error(f"获取对话历史失败: {e}")
-            return ""
-
-    async def _get_persona_prompt(self, event: AstrMessageEvent) -> str:
-        """获取当前对话的人格系统提示词"""
-        try:
-            persona_mgr = self.context.persona_manager
-            if not persona_mgr:
-                return "默认角色：智能助手"
-
-            # 获取当前对话的人格ID
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
-            persona_id = None
-            if curr_cid:
-                conversation = await self.context.conversation_manager.get_conversation(event.unified_msg_origin, curr_cid)
-                if conversation:
-                    persona_id = conversation.persona_id
-
-            # 用户显式取消人格
-            if persona_id == "[%None]":
-                return "默认角色：智能助手"
-
-            if persona_id:
-                try:
-                    persona = await persona_mgr.get_persona(persona_id)
-                    return persona.system_prompt or "默认角色：智能助手"
-                except ValueError:
-                    logger.debug(f"未找到人格 {persona_id}，回退到默认人格")
-
-            # 使用默认人格
-            default_persona = await persona_mgr.get_default_persona_v3(event.unified_msg_origin)
-            return default_persona.get("prompt", "默认角色：智能助手")
-
-        except Exception as e:
-            logger.debug(f"获取人格系统提示词失败: {e}")
-            return "默认角色：智能助手"
-
-    def _build_judge_prompt(self, history: str, current_msg: str, sender: str, persona: str) -> str:
-        """构建判断 Prompt"""
-        return self.judge_prompt.format(
-            history=history or "无历史对话",
-            current_msg=current_msg,
-            sender=sender or "未知用户",
-            persona=persona,
-            threshold=self.reply_threshold
-        )
-
-    def _parse_result(self, response_text: str) -> tuple:
-        """解析 LLM 返回结果，返回 (should_reply, reason)"""
-        try:
-            # 去除 markdown 代码块
-            cleaned = re.sub(r"^```(?:json)?\s*", "", response_text.strip(), flags=re.IGNORECASE)
-            cleaned = re.sub(r"\s*```$", "", cleaned).strip()
-
-            # 提取 JSON
-            json_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
-            if json_match:
-                result = json.loads(json_match.group(0))
-
-                should_reply = result.get("should_reply", False)
-                reason = result.get("reason", "")
-
-                # 计算综合评分（如果有分数维度）
-                relevance = result.get("relevance", 0)
-                willingness = result.get("willingness", 0)
-                social = result.get("social", 0)
-                timing = result.get("timing", 0)
-
-                if relevance or willingness or social or timing:
-                    overall_score = (relevance + willingness + social + timing) / 40.0  # 4个维度平均
-                    logger.info(f"判断结果: 评分={overall_score:.2f}, should_reply={should_reply}, reason={reason}")
-
-                    # 如果综合评分达到阈值，也认为应该回复
-                    if overall_score >= self.reply_threshold:
-                        should_reply = True
-                else:
-                    logger.info(f"判断结果: should_reply={should_reply}, reason={reason}")
-
-                return should_reply, reason
-
-            # 简单文本判断
-            if "should_reply: true" in response_text.lower() or '"should_reply": true' in response_text.lower():
-                return True, "文本判断通过"
-
-            return False, ""
-
-        except json.JSONDecodeError as e:
-            logger.warning(f"JSON 解析失败: {e}")
-            return False, ""
+        return {
+            "timestamp": time.time(),
+            "sender_id": event.get_sender_id(),
+            "sender_name": event.get_sender_name() or "未知用户",
+            "content": text_content.strip(),
+            "has_image": has_image,
+            "is_self": event.get_sender_id() == event.get_self_id(),
+        }
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=5)
     async def on_all_message(self, event: AstrMessageEvent):
-        """监听所有消息，智能判断是否回复"""
-        # 基础过滤
-        if not self._should_process(event):
-            logger.debug("消息被过滤，跳过")
-            return
-
-        # 跳过已经被唤醒的消息
-        if event.is_at_or_wake_command:
-            logger.debug("消息已被唤醒，跳过判断")
-            return
-
-        # 跳过机器人自己的消息
-        if event.get_sender_id() == event.get_self_id():
-            return
-
-        # 消息类型检查
-        should_skip, skip_reason = self._check_message_type(event)
-        if should_skip:
-            logger.debug(f"跳过: {skip_reason}")
-            return
-
-        # 文本长度检查
-        if not self._check_text_length(event):
-            logger.debug("文本长度不足，跳过判断")
-            return
-
-        # 冷却期检查
+        """监听所有消息，状态机制处理"""
         session_id = event.unified_msg_origin
-        if self._is_in_cooldown(session_id):
-            logger.debug("会话处于冷却期，跳过判断")
+
+        # 1. 基础过滤
+        if not self._should_process(event):
             return
 
-        # 处理锁机制
-        if self.processing_lock_enabled:
-            lock = self._get_session_lock(session_id)
-            if lock.locked():
-                logger.debug("会话正在处理其他消息，跳过")
+        # 2. 跳过机器人自己的消息（但仍缓存用于上下文）
+        is_self = event.get_sender_id() == event.get_self_id()
+        if is_self:
+            # 只缓存自己的消息，不处理
+            self.ledger.add_message(session_id, self._extract_message_info(event))
+            return
+
+        # 3. 提取并缓存消息（立即完成，不阻塞）
+        message_info = self._extract_message_info(event)
+        self.ledger.add_message(session_id, message_info)
+
+        # 4. 如果是 @/唤醒消息，立即标记需要回复
+        if event.is_at_or_wake_command:
+            self.state_manager.transition(session_id, PluginState.SUMMONED)
+            self._schedule_analysis(session_id, event)
+            return
+
+        # 5. 根据状态路由处理
+        state = self.state_manager.get_state(session_id)
+
+        if state == PluginState.NOT_PRESENT:
+            # 快速检测触发条件（密集讨论/复读）
+            should_trigger, reason = should_trigger_active_state(
+                self.ledger, session_id,
+                dense_threshold=self.dense_threshold,
+                dense_participants=self.dense_participants,
+                dense_window=self.dense_window,
+                echo_threshold=self.echo_threshold,
+                echo_window=self.echo_window,
+            )
+            if should_trigger:
+                logger.info(f"状态触发: {reason}")
+                self.state_manager.transition(session_id, PluginState.GETTING_FAMILIAR)
+                self._schedule_analysis(session_id, event)
+
+        elif state == PluginState.SUMMONED:
+            # 已标记需要回复，如果还没有任务则创建
+            self._schedule_analysis(session_id, event)
+
+        elif state == PluginState.GETTING_FAMILIAR:
+            # 尝试融入，触发分析
+            self._schedule_analysis(session_id, event)
+
+        elif state == PluginState.OBSERVATION:
+            # 观察期，检查是否应该继续参与
+            # 简单策略：观察期内每条消息都触发分析（由间隔控制频率）
+            self._schedule_analysis(session_id, event)
+
+    def _schedule_analysis(self, session_id: str, event: AstrMessageEvent) -> None:
+        """
+        创建后台任务执行 LLM 分析。
+        使用 asyncio.create_task() 不阻塞当前事件处理。
+        """
+        # 检查最小间隔，避免频繁触发
+        last_time = self._last_analysis_time.get(session_id, 0)
+        if time.time() - last_time < self._analysis_interval:
+            return
+
+        # 防止重复创建任务
+        if session_id in self._pending_tasks:
+            existing_task = self._pending_tasks[session_id]
+            if not existing_task.done():
                 return
-            async with lock:
-                await self._process_message(event)
-        else:
-            await self._process_message(event)
 
-    async def _process_message(self, event: AstrMessageEvent):
-        """核心消息处理逻辑"""
-        current_msg = event.message_str
-        sender = event.get_sender_name() or "未知用户"
+        # 创建后台任务
+        self._last_analysis_time[session_id] = time.time()
+        task = asyncio.create_task(self._async_analyze(session_id, event))
+        self._pending_tasks[session_id] = task
 
-        # 获取上下文和人格
-        history = await self._get_history(event)
-        persona = await self._get_persona_prompt(event)
+        task.add_done_callback(
+            lambda t: self._pending_tasks.pop(session_id, None)
+        )
 
-        # 构建 prompt
-        prompt = self._build_judge_prompt(history, current_msg, sender, persona)
+    async def _async_analyze(self, session_id: str, event: AstrMessageEvent) -> None:
+        """
+        后台异步执行的分析任务。
+        """
+        try:
+            # 获取累积的未处理消息
+            unprocessed = self.ledger.get_unprocessed_messages(session_id)
 
-        # 获取判断模型提供商
+            if not unprocessed:
+                return
+
+            # 获取背景消息（已处理的）
+            all_messages = self.ledger.get_messages(session_id)
+            last_processed = self.ledger._processed_marks.get(session_id, 0)
+            background = [
+                msg for msg in all_messages
+                if msg.get("timestamp", 0) <= last_processed
+            ]
+
+            # 构建分析 prompt
+            background_text = self._format_messages(background[-5:])  # 最近5条背景
+            recent_text = self._format_messages(unprocessed)
+
+            # 获取人格
+            persona = await self._get_persona_prompt(event)
+
+            prompt = self.judge_prompt.format(
+                persona=persona,
+                background=background_text or "无背景对话",
+                recent=recent_text,
+                threshold=self.reply_threshold,
+            )
+
+            # 调用 LLM
+            result = await self._call_llm(session_id, event, prompt)
+
+            if result and result.should_reply:
+                logger.info(f"分析结果: should_reply=True, topic={result.topic}, reason={result.reason}")
+
+                # 标记消息为已处理
+                self.ledger.mark_processed(session_id)
+
+                # 转换状态到观察期
+                self.state_manager.transition(session_id, PluginState.OBSERVATION)
+
+                # 触发回复
+                event.is_at_or_wake_command = True
+                event.set_extra("smart_reply_triggered", True)
+                event.set_extra("analysis_topic", result.topic)
+                event.set_extra("analysis_strategy", result.reply_strategy)
+            else:
+                logger.debug(f"分析结果: should_reply=False")
+                # 不回复，继续观察
+
+        except Exception as e:
+            logger.error(f"异步分析失败: {e}")
+
+    def _format_messages(self, messages: list[dict]) -> str:
+        """格式化消息列表为文本"""
+        if not messages:
+            return ""
+
+        lines = []
+        for msg in messages:
+            sender = msg.get("sender_name", "未知")
+            content = msg.get("content", "")
+            if content:
+                lines.append(f"{sender}: {content}")
+            elif msg.get("has_image"):
+                lines.append(f"{sender}: [图片]")
+
+        return "\n".join(lines)
+
+    async def _call_llm(
+        self,
+        session_id: str,
+        event: AstrMessageEvent,
+        prompt: str,
+    ) -> AnalysisDecision | None:
+        """调用 LLM 进行分析"""
         judge_provider = None
         default_provider_id = None
 
@@ -365,23 +364,20 @@ class EchoSensePlugin(Star):
             except Exception as e:
                 logger.warning(f"获取判断模型提供商失败: {e}")
 
-        # 如果没有配置判断模型，获取当前对话默认模型
         if not judge_provider:
-            umo = event.unified_msg_origin
-            default_provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            default_provider_id = await self.context.get_current_chat_provider_id(
+                umo=event.unified_msg_origin
+            )
             if not default_provider_id:
                 logger.warning("无法获取当前聊天模型 ID")
-                return
-
-        # 调用 LLM 判断
-        logger.info(f"调用 LLM 判断: {current_msg[:50]}...")
+                return None
 
         try:
             if judge_provider:
                 llm_resp = await judge_provider.text_chat(
                     prompt=prompt,
                     contexts=[],
-                    image_urls=[]
+                    image_urls=[],
                 )
             else:
                 llm_resp = await self.context.llm_generate(
@@ -391,36 +387,115 @@ class EchoSensePlugin(Star):
 
             if not llm_resp or not llm_resp.completion_text:
                 logger.warning("LLM 返回空响应")
-                return
+                return None
+
+            return self._parse_decision(llm_resp.completion_text)
 
         except Exception as e:
-            logger.error(f"LLM 判断调用失败: {e}")
-            return
+            logger.error(f"LLM 调用失败: {e}")
+            return None
 
-        # 解析结果
-        should_reply, reason = self._parse_result(llm_resp.completion_text)
+    def _parse_decision(self, response_text: str) -> AnalysisDecision | None:
+        """解析 LLM 返回结果"""
+        try:
+            cleaned = re.sub(
+                r"^```(?:json)?\s*", "", response_text.strip(),
+                flags=re.IGNORECASE
+            )
+            cleaned = re.sub(r"\s*```$", "", cleaned).strip()
 
-        if should_reply:
-            logger.info(f"智能回复判断通过: {reason}")
-            self._mark_reply_time(event.unified_msg_origin)
-            event.is_at_or_wake_command = True
-            event.set_extra("smart_reply_triggered", True)
-            return
-        else:
-            logger.debug(f"智能回复判断不通过: {reason}")
+            json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group(0))
+
+                return AnalysisDecision(
+                    should_reply=data.get("should_reply", False),
+                    topic=data.get("topic", ""),
+                    reply_strategy=data.get("reply_strategy", ""),
+                    reply_target=data.get("reply_target", ""),
+                    reason=data.get("reason", ""),
+                    relevance=float(data.get("relevance", 0)),
+                    willingness=float(data.get("willingness", 0)),
+                    social=float(data.get("social", 0)),
+                    timing=float(data.get("timing", 0)),
+                )
+
+            # 简单文本判断
+            if "should_reply: true" in response_text.lower():
+                return AnalysisDecision(should_reply=True, reason="文本判断通过")
+
+            return AnalysisDecision(should_reply=False)
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON 解析失败: {e}")
+            return None
+
+    async def _get_persona_prompt(self, event: AstrMessageEvent) -> str:
+        """获取当前对话的人格系统提示词"""
+        try:
+            persona_mgr = self.context.persona_manager
+            if not persona_mgr:
+                return "默认角色：智能助手"
+
+            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(
+                event.unified_msg_origin
+            )
+            persona_id = None
+            if curr_cid:
+                conversation = await self.context.conversation_manager.get_conversation(
+                    event.unified_msg_origin, curr_cid
+                )
+                if conversation:
+                    persona_id = conversation.persona_id
+
+            if persona_id == "[%None]":
+                return "默认角色：智能助手"
+
+            if persona_id:
+                try:
+                    persona = await persona_mgr.get_persona(persona_id)
+                    return persona.system_prompt or "默认角色：智能助手"
+                except ValueError:
+                    logger.debug(f"未找到人格 {persona_id}")
+
+            default_persona = await persona_mgr.get_default_persona_v3(
+                event.unified_msg_origin
+            )
+            return default_persona.get("prompt", "默认角色：智能助手")
+
+        except Exception as e:
+            logger.debug(f"获取人格失败: {e}")
+            return "默认角色：智能助手"
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req):
-        """智能回复触发时，在 LLM 请求前注入提示"""
+        """智能回复触发时，注入提示"""
         if not event.get_extra("smart_reply_triggered"):
             return
+
         if not req or not hasattr(req, "system_prompt"):
             return
-        note = "\n（注意：本次是你主动参与对话的，回复应自然随意。）"
+
+        topic = event.get_extra("analysis_topic", "")
+        strategy = event.get_extra("analysis_strategy", "")
+
+        note = "\n（本次是你主动参与对话的，回复应自然随意。"
+        if topic:
+            note += f" 当前话题: {topic}。"
+        if strategy:
+            note += f" 建议: {strategy}"
+        note += "）"
+
         req.system_prompt = (req.system_prompt or "") + note
 
     async def terminate(self):
         """插件销毁方法"""
-        self._cooldown_tracker.clear()
-        self._processing_locks.clear()
-        logger.info("智能回复插件已卸载")
+        # 取消所有待处理任务
+        for task in self._pending_tasks.values():
+            if not task.done():
+                task.cancel()
+
+        self._pending_tasks.clear()
+        self.ledger.clear_all()
+        self.state_manager.clear_all()
+        logger.info("EchoSense 插件已卸载")
