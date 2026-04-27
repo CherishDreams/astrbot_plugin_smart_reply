@@ -7,9 +7,12 @@ AstrBot EchoSense 回响感知插件
 
 import json
 import re
+import time
+import asyncio
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
+from astrbot.api.message_components import Plain, Image, Face
 
 
 class EchoSensePlugin(Star):
@@ -40,35 +43,41 @@ class EchoSensePlugin(Star):
 请严格按照以下JSON格式输出结果，不要输出其他内容：
 {{"relevance": 分数, "willingness": 分数, "social": 分数, "timing": 分数, "should_reply": true或false, "reason": "判断理由"}}"""
 
-    def __init__(self, context: Context):
-        super().__init__(context)
-        self.filter_mode = "none"
-        self.filter_list = []
-        self.history_count = 10
-        self.reply_threshold = 0.6
-        self.judge_provider_id = ""
-        self.judge_prompt = self.DEFAULT_JUDGE_PROMPT
+    def __init__(self, context: Context, config: dict | None = None):
+        super().__init__(context, config)
+        self.config = config or {}
 
-    async def initialize(self):
-        """插件初始化方法，加载配置"""
-        config = self.context.get_config() or {}
-
-        # 基础设置
-        basic = config.get("basic", {})
+        # 基础配置
+        basic = self.config.get("basic", {})
         self.filter_mode = basic.get("filter_mode", "none")
         self.filter_list = basic.get("filter_list", [])
         self.history_count = basic.get("history_count", 10)
         self.reply_threshold = basic.get("reply_threshold", 0.6)
 
-        # 模型设置
-        model_config = config.get("model", {})
+        # 模型配置
+        model_config = self.config.get("model", {})
         self.judge_provider_id = model_config.get("judge_provider_id", "")
 
-        # 提示词设置
-        prompt_config = config.get("prompt", {})
+        # 提示词配置
+        prompt_config = self.config.get("prompt", {})
         self.judge_prompt = prompt_config.get("judge_prompt", self.DEFAULT_JUDGE_PROMPT)
 
+        # 防刷屏配置
+        anti_spam = self.config.get("anti_spam", {})
+        self.skip_image_message = anti_spam.get("skip_image_message", True)
+        self.skip_face_message = anti_spam.get("skip_face_message", True)
+        self.cooldown_seconds = anti_spam.get("cooldown_seconds", 30)
+        self.min_text_length = anti_spam.get("min_text_length", 2)
+        self.processing_lock_enabled = anti_spam.get("processing_lock", True)
+
+        # 运行时状态追踪
+        self._cooldown_tracker: dict[str, float] = {}
+        self._processing_locks: dict[str, asyncio.Lock] = {}
+
+    async def initialize(self):
+        """插件初始化方法"""
         logger.info(f"智能回复插件初始化完成: 模式={self.filter_mode}, 过滤列表={len(self.filter_list)}条, 阈值={self.reply_threshold}, 判断模型={self.judge_provider_id or '默认'}")
+        logger.info(f"防刷屏配置: 跳过图片={self.skip_image_message}, 跳过表情={self.skip_face_message}, 冷却={self.cooldown_seconds}s, 处理锁={self.processing_lock_enabled}")
 
     def _should_process(self, event: AstrMessageEvent) -> bool:
         """检查消息是否应该被处理"""
@@ -103,6 +112,69 @@ class EchoSensePlugin(Star):
             return not in_list
 
         return True
+
+    def _check_message_type(self, event: AstrMessageEvent) -> tuple[bool, str]:
+        """检查消息类型是否应该跳过判断。返回 (should_skip, skip_reason)"""
+        messages = event.get_messages()
+
+        # 检查是否包含图片
+        if self.skip_image_message:
+            for comp in messages:
+                if isinstance(comp, Image):
+                    return True, "包含图片消息"
+
+        # 检查是否为纯表情消息
+        if self.skip_face_message:
+            has_face = False
+            has_text = False
+            for comp in messages:
+                if isinstance(comp, Face):
+                    has_face = True
+                elif isinstance(comp, Plain) and comp.text.strip():
+                    has_text = True
+            if has_face and not has_text:
+                return True, "纯表情消息"
+
+        return False, ""
+
+    def _check_text_length(self, event: AstrMessageEvent) -> bool:
+        """检查文本长度是否足够触发判断"""
+        if self.min_text_length <= 0:
+            return True
+
+        messages = event.get_messages()
+        text_content = ""
+        for comp in messages:
+            if isinstance(comp, Plain):
+                text_content += comp.text
+
+        if not text_content.strip():
+            return True  # 不是纯文本消息，交给其他检查处理
+
+        return len(text_content.strip()) >= self.min_text_length
+
+    def _is_in_cooldown(self, session_id: str) -> bool:
+        """检查会话是否处于冷却期"""
+        if self.cooldown_seconds <= 0:
+            return False
+
+        last_reply_time = self._cooldown_tracker.get(session_id, 0)
+        if last_reply_time == 0:
+            return False
+
+        elapsed = time.time() - last_reply_time
+        return elapsed < self.cooldown_seconds
+
+    def _mark_reply_time(self, session_id: str) -> None:
+        """记录回复时间，开始冷却期"""
+        if self.cooldown_seconds > 0:
+            self._cooldown_tracker[session_id] = time.time()
+
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """获取会话的处理锁"""
+        if session_id not in self._processing_locks:
+            self._processing_locks[session_id] = asyncio.Lock()
+        return self._processing_locks[session_id]
 
     async def _get_history(self, event: AstrMessageEvent) -> str:
         """获取对话历史"""
@@ -227,12 +299,12 @@ class EchoSensePlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL, priority=5)
     async def on_all_message(self, event: AstrMessageEvent):
         """监听所有消息，智能判断是否回复"""
-        # 消息过滤
+        # 基础过滤
         if not self._should_process(event):
-            logger.debug(f"消息被过滤，跳过")
+            logger.debug("消息被过滤，跳过")
             return
 
-        # 跳过已经被唤醒的消息（用户主动呼叫）
+        # 跳过已经被唤醒的消息
         if event.is_at_or_wake_command:
             logger.debug("消息已被唤醒，跳过判断")
             return
@@ -241,6 +313,36 @@ class EchoSensePlugin(Star):
         if event.get_sender_id() == event.get_self_id():
             return
 
+        # 消息类型检查
+        should_skip, skip_reason = self._check_message_type(event)
+        if should_skip:
+            logger.debug(f"跳过: {skip_reason}")
+            return
+
+        # 文本长度检查
+        if not self._check_text_length(event):
+            logger.debug("文本长度不足，跳过判断")
+            return
+
+        # 冷却期检查
+        session_id = event.unified_msg_origin
+        if self._is_in_cooldown(session_id):
+            logger.debug("会话处于冷却期，跳过判断")
+            return
+
+        # 处理锁机制
+        if self.processing_lock_enabled:
+            lock = self._get_session_lock(session_id)
+            if lock.locked():
+                logger.debug("会话正在处理其他消息，跳过")
+                return
+            async with lock:
+                await self._process_message(event)
+        else:
+            await self._process_message(event)
+
+    async def _process_message(self, event: AstrMessageEvent):
+        """核心消息处理逻辑"""
         current_msg = event.message_str
         sender = event.get_sender_name() or "未知用户"
 
@@ -276,14 +378,12 @@ class EchoSensePlugin(Star):
 
         try:
             if judge_provider:
-                # 使用配置的判断模型
                 llm_resp = await judge_provider.text_chat(
                     prompt=prompt,
                     contexts=[],
                     image_urls=[]
                 )
             else:
-                # 使用当前对话默认模型
                 llm_resp = await self.context.llm_generate(
                     chat_provider_id=default_provider_id,
                     prompt=prompt,
@@ -302,10 +402,9 @@ class EchoSensePlugin(Star):
 
         if should_reply:
             logger.info(f"智能回复判断通过: {reason}")
-            # 设置唤醒标志，让 AstrBot 核心系统处理消息并生成人格回复
+            self._mark_reply_time(event.unified_msg_origin)
             event.is_at_or_wake_command = True
             event.set_extra("smart_reply_triggered", True)
-            # 不返回任何内容，让核心系统继续处理
             return
         else:
             logger.debug(f"智能回复判断不通过: {reason}")
@@ -322,4 +421,6 @@ class EchoSensePlugin(Star):
 
     async def terminate(self):
         """插件销毁方法"""
+        self._cooldown_tracker.clear()
+        self._processing_locks.clear()
         logger.info("智能回复插件已卸载")
