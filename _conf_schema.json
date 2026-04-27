@@ -128,5 +128,11 @@
         "hint": "检测复读的时间窗口。"
       }
     }
+  },
+  "debug_mode": {
+    "description": "调试模式",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后输出详细日志，包括消息缓存、状态转换、门牌锁、分析过程等。"
   }
 }
